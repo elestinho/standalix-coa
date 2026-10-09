@@ -375,7 +375,7 @@ function rebrandPDF(mupdf, bytes, cfgRaw, lib, logoPng, opciones = {}) {
   const cambios = [], avisos = [], aprendidos = [];
   const umbral = cfg.umbral_logo || 40;
   const helv = new mupdf.Font("Helvetica"), helvB = new mupdf.Font("Helvetica-Bold");
-  let zonaP1 = null, vectoresP1 = [], anchoP1 = 0;
+  let zonaP1 = null, vectoresP1 = [], anchoP1 = 0, boundsP1 = null, textoP1 = [], borradoP1 = [];
   const n = doc.countPages();
 
   for (let pi = 0; pi < n; pi++) {
@@ -542,20 +542,34 @@ function rebrandPDF(mupdf, bytes, cfgRaw, lib, logoPng, opciones = {}) {
       escribirTexto(mupdf, doc, page, texto, o, size, sp.color, [f]);
     }
 
-    if (pi === 0) { zonaP1 = zona; vectoresP1 = vectores; anchoP1 = bounds[2] - bounds[0]; }
+    if (pi === 0) {
+      zonaP1 = zona; vectoresP1 = vectores; anchoP1 = bounds[2] - bounds[0]; boundsP1 = bounds;
+      textoP1 = [...lineas.filter(l => l.texto.trim()).map(l => l.bbox), ...segOCR.map(sg => sg.bbox)];
+      borradoP1 = [...borrarDir, ...borrar, ...borrarOCR, ...logos, ...manual];
+    }
   }
 
-  // 6) Logo nuevo en la cabecera de la página 1
+  // 6) Logo nuevo en la cabecera de la página 1: siempre grande. Ocupa todo el hueco que dejan
+  //    los logos quitados, entre el borde superior y la primera raya o el primer texto que quede.
   if (logoPng && zonaP1) {
     const page = doc.loadPage(0);
     const img = new mupdf.Image(logoPng);
     const asp = img.getWidth() / img.getHeight();
-    const z = [...zonaP1];
-    for (const v of vectoresP1) {
-      if (v[2] - v[0] > anchoP1 * 0.5 && v[3] - v[1] < 3 && z[1] + 20 < v[1] && v[1] < z[3]) z[3] = Math.min(z[3], v[1]);
-    }
-    z[3] -= 6;
-    let h = Math.min(z[3] - z[1], cfg.logo_nuevo_alto_max || 95);
+    const altoMax = cfg.logo_nuevo_alto_max || 95;
+    const b = boundsP1;
+    const regla = vectoresP1.filter(v => v[2] - v[0] > anchoP1 * 0.5 && v[3] - v[1] < 3 && v[1] > zonaP1[1] + 20 && v[1] < b[1] + (b[3] - b[1]) * 0.35)
+      .reduce((m, v) => (!m || v[1] < m[1] ? v : m), null);
+    const xi = regla ? Math.max(regla[0], b[0] + 20) : b[0] + 36, xd = regla ? Math.min(regla[2], b[2] - 20) : b[2] - 36;
+    const yTop = Math.max(zonaP1[1], b[1] + 10);
+    // el texto que sigue ahí (no borrado) limita por abajo; lo borrado cuenta como hueco
+    const dentroZona = r => r[0] >= zonaP1[0] - 1 && r[2] <= zonaP1[2] + 1 && r[1] >= zonaP1[1] - 1 && r[3] <= zonaP1[3] + 1;
+    const queda = r => !borradoP1.some(d => cubre(d, r) > 0.5) && !dentroZona(r);
+    let yFin = yTop + altoMax + 10;
+    if (regla) yFin = Math.min(yFin, regla[1] - 6);
+    for (const t of textoP1) if (t[1] > yTop + 10 && t[0] < xd && t[2] > xi && queda(t)) yFin = Math.min(yFin, t[1] - 6);
+    let z = [xi, yTop, xd, yFin];
+    if (z[3] - z[1] < 40) z = [Math.min(zonaP1[0], xi), zonaP1[1], Math.max(zonaP1[2], xd), Math.max(zonaP1[3], z[1] + 40)];
+    let h = Math.min(z[3] - z[1], altoMax);
     const w = Math.min(z[2] - z[0], h * asp); h = w / asp;
     const x0 = z[0] + (z[2] - z[0] - w) / 2, y0 = z[1] + (z[3] - z[1] - h) / 2;
     insertarLogo(mupdf, doc, page, logoPng, [x0, y0, x0 + w, y0 + h]);
