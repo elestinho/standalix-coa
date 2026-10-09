@@ -110,7 +110,7 @@ details pre{font-family:var(--font-mono);font-size:.78rem;white-space:pre-wrap;o
   <div id="lista" class="lista"></div>
 
 
-  <p class="pie">La traducción la hace el traductor integrado de Google Chrome en tu propio ordenador (hace falta Chrome de escritorio, versión 138 o posterior); el PDF no se envía a nadie. Es una traducción automática: revísala antes de dársela a un cliente, sobre todo las frases H y P, que tienen traducción oficial.</p>
+  <p class="pie">La traducción se hace en tu propio ordenador y el PDF no se envía a nadie. En Google Chrome de escritorio (versión 138 o posterior) usa el traductor integrado. En Safari y otros navegadores usa un modelo que se descarga una sola vez por idioma (unos 100 MB): solo traduce fichas en inglés y es más lento y menos preciso. Es una traducción automática: revísala antes de dársela a un cliente, sobre todo las frases H y P, que tienen traducción oficial.</p>
 
 </div>
 
@@ -991,7 +991,7 @@ function nota(texto){ const n = $("notaIdioma"); n.hidden = !texto; n.textConten
 async function prepararTraductor(destino, origen = "en"){
   const clave = origen + ">" + destino;
   if(traductores[clave]) return traductores[clave];
-  if(!("Translator" in self)) throw new Error("Este navegador no trae traductor integrado. Abre la web en Google Chrome de escritorio (versión 138 o posterior).");
+  if(!("Translator" in self)) return prepararModelo(destino, origen);
   const disp = await Translator.availability({ sourceLanguage: origen, targetLanguage: destino });
   if(disp === "unavailable") throw new Error(`Chrome no puede traducir de ${origen} a ${NOMBRE_IDIOMA[destino] || destino} en este ordenador.`);
   traductores[clave] = Translator.create({ sourceLanguage: origen, targetLanguage: destino, monitor(m){
@@ -999,12 +999,76 @@ async function prepararTraductor(destino, origen = "en"){
   }}).catch(e => { delete traductores[clave]; throw e; });
   return traductores[clave];
 }
+
+// ---- Alternativa para Safari y otros navegadores: modelo de traducción (OPUS-MT) que se ejecuta en el propio navegador.
+// Solo traduce del inglés. Se descarga una vez por idioma (decenas de MB) y el navegador lo guarda.
+let transformers = null;
+async function cargarTransformers(){
+  if(transformers) return transformers;
+  transformers = (window.TF_IMPORT ? window.TF_IMPORT() : import("./transformers/transformers.min.js")).then(tf => {
+    tf.env.allowLocalModels = false;
+    const onnx = tf.env.backends.onnx.wasm;
+    onnx.wasmPaths = new URL("./transformers/", location.href).href;
+    onnx.numThreads = 1; // Safari no permite varios hilos sin cabeceras especiales
+    return tf;
+  }).catch(e => { transformers = null; throw e; });
+  return transformers;
+}
+function trozosDe(texto, max = 320){
+  if(texto.length <= max) return [texto];
+  const frases = texto.split(/(?<=[.;:!?])\s+/), out = [];
+  let cur = "";
+  for(const f of frases){
+    if(cur && (cur + " " + f).length > max){ out.push(cur); cur = f; } else cur = cur ? cur + " " + f : f;
+  }
+  if(cur) out.push(cur);
+  // una frase suelta muy larga se corta por palabras
+  return out.flatMap(t => { if(t.length <= max * 1.5) return [t]; const w = t.split(" "), r = []; let c = ""; for(const x of w){ if(c && (c + " " + x).length > max){ r.push(c); c = x; } else c = c ? c + " " + x : x; } if(c) r.push(c); return r; });
+}
+function prepararModelo(destino, origen){
+  const clave = origen + ">" + destino;
+  if(origen !== "en") throw new Error("Con este navegador solo se pueden traducir fichas en inglés. Para otros idiomas usa Google Chrome de escritorio.");
+  traductores[clave] = (async () => {
+    nota(`Cargando el motor de traducción… (este navegador no tiene traductor propio; se usará un modelo que se descarga una sola vez)`);
+    const tf = await cargarTransformers().catch(e => { throw new Error("No se ha podido iniciar el motor de traducción de este navegador (" + (e.message || e) + ")."); });
+    const archivos = new Map();
+    const modelo = await tf.pipeline("translation", "Xenova/opus-mt-en-" + destino, {
+      dtype: "q8", device: "wasm",
+      progress_callback: p => {
+        if(p.status === "progress" && p.file){ archivos.set(p.file, [p.loaded || 0, p.total || 0]); }
+        if(p.status === "progress" || p.status === "ready"){
+          let l = 0, t = 0; archivos.forEach(([a, b]) => { l += a; t += b; });
+          if(t) nota(`Descargando el modelo de traducción al ${NOMBRE_IDIOMA[destino]}… ${Math.round(l / 1048576)} de ${Math.round(t / 1048576)} MB (solo la primera vez)`);
+        }
+      },
+    }).catch(e => { throw new Error("No se ha podido descargar o iniciar el modelo de traducción (" + (e.message || e) + "). Comprueba la conexión y vuelve a elegir el idioma."); });
+    nota(`Traducción al ${NOMBRE_IDIOMA[destino]} lista (modelo en el navegador: es más lenta y menos precisa que la de Chrome).`);
+    const traducirLote = async textos => {
+      // cada texto largo se parte en trozos; se traduce por tandas y se vuelve a unir
+      const trozos = textos.map(t => trozosDe(t)), planos = trozos.flat();
+      const salida = [];
+      for(let i = 0; i < planos.length; i += 8){
+        const r = await modelo(planos.slice(i, i + 8), { max_new_tokens: 400, num_beams: 1 });
+        for(const x of (Array.isArray(r) ? r : [r])) salida.push(x.translation_text);
+        await new Promise(ok => setTimeout(ok, 0));
+      }
+      let k = 0;
+      return trozos.map(ts => ts.map(() => salida[k++]).join(" "));
+    };
+    return { lote: traducirLote, translate: async t => (await traducirLote([t]))[0] };
+  })().catch(e => { delete traductores[clave]; throw e; });
+  return traductores[clave];
+}
 // Se prepara al elegir el idioma: Chrome solo deja descargar el traductor justo después de un clic.
 if($("idioma")) $("idioma").onchange = async () => {
   const d = $("idioma").value;
   if(!d){ nota(""); return; }
   nota(`Preparando el traductor al ${NOMBRE_IDIOMA[d]}…`);
-  try{ await prepararTraductor(d); nota(`Traducción al ${NOMBRE_IDIOMA[d]} lista. Los PDF que sueltes ahora saldrán traducidos.`); }
+  try{
+    const tr = await prepararTraductor(d);
+    nota(tr.lote ? `Traducción al ${NOMBRE_IDIOMA[d]} lista (modelo en el navegador: más lenta y menos precisa que la de Chrome). Los PDF que sueltes ahora saldrán traducidos.`
+      : `Traducción al ${NOMBRE_IDIOMA[d]} lista. Los PDF que sueltes ahora saldrán traducidos.`);
+  }
   catch(e){ nota(e.message || String(e)); }
 };
 async function idiomaOrigen(textos){
@@ -1025,16 +1089,28 @@ async function traducirPDF(el, pdf, destino){
   try{ tr = await prepararTraductor(destino, origen); }
   catch(e){ return { pdf, hechas: 0, info: "", aviso: "No se ha traducido: " + (e.message || e) + (origen !== "en" ? " Vuelve a elegir el idioma en la lista y suelta el PDF otra vez." : "") }; }
   const res = new Map(); let n = 0;
-  const cola = [...unidades];
-  const trabajador = async () => {
-    for(let u = cola.shift(); u; u = cola.shift()){
-      const clave = origen + ">" + destino + "|" + u.texto;
-      if(!cacheTrad.has(clave)) cacheTrad.set(clave, await tr.translate(u.texto).catch(() => u.texto));
-      res.set(u.id, cacheTrad.get(clave));
-      if(++n % 10 === 0 || n === unidades.length) marcar(el, "run", `Traduciendo ${n} de ${unidades.length}`);
+  if(tr.lote){
+    // modelo en el navegador: se traduce en tandas, en orden
+    const cola = [...unidades];
+    while(cola.length){
+      const tanda = cola.splice(0, 16);
+      const out = await tr.lote(tanda.map(u => u.texto)).catch(() => tanda.map(u => u.texto));
+      tanda.forEach((u, i) => res.set(u.id, out[i] || u.texto));
+      n += tanda.length;
+      marcar(el, "run", `Traduciendo ${n} de ${unidades.length}`);
     }
-  };
-  await Promise.all([trabajador(), trabajador(), trabajador()]);
+  } else {
+    const cola = [...unidades];
+    const trabajador = async () => {
+      for(let u = cola.shift(); u; u = cola.shift()){
+        const clave = origen + ">" + destino + "|" + u.texto;
+        if(!cacheTrad.has(clave)) cacheTrad.set(clave, await tr.translate(u.texto).catch(() => u.texto));
+        res.set(u.id, cacheTrad.get(clave));
+        if(++n % 10 === 0 || n === unidades.length) marcar(el, "run", `Traduciendo ${n} de ${unidades.length}`);
+      }
+    };
+    await Promise.all([trabajador(), trabajador(), trabajador()]);
+  }
   const t = ENGINE.aplicarTraduccion(mupdf, pdf, paginas, res, { idioma: destino });
   return { pdf: t.pdf, hechas: t.hechas, reducidas: t.reducidas, info: ` · traducido al ${NOMBRE_IDIOMA[destino]}` };
 }
