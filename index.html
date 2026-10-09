@@ -16,6 +16,10 @@ body{background:var(--bg);color:var(--fg);font-family:var(--font-ui);font-size:1
 .wrap{max-width:860px;margin:0 auto;padding-inline:16px;padding-block:32px 48px;display:flex;flex-direction:column;gap:20px}
 h1{font-size:1.6rem;margin:0;text-wrap:balance;letter-spacing:-.01em}
 .sub{color:var(--muted);margin:4px 0 0;max-width:65ch}
+.opciones{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.opciones label{display:flex;gap:8px;align-items:center}
+.opciones select{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px}
+.opciones .nota{flex-basis:100%;margin:0;color:var(--muted);font-size:.85rem}
 .drop{border:2px dashed var(--line);border-radius:12px;background:var(--panel);padding:36px 20px;text-align:center;cursor:pointer;transition:border-color .15s,background .15s}
 .drop:hover,.drop:focus-visible,.drop.over{border-color:var(--accent);background:var(--accent-soft);outline:none}
 .drop strong{display:block;font-size:1.15rem}
@@ -65,6 +69,19 @@ details pre{font-family:var(--font-mono);font-size:.78rem;white-space:pre-wrap;o
     <p class="sub">Suelta los certificados del proveedor y descarga la versión Standalix: sin logos, sellos, dirección ni menciones del proveedor, con el prefijo ST-EA- en el CAT Number. Los PDF se procesan en tu navegador y no se suben a ningún sitio.</p>
   </header>
 
+  <div class="opciones">
+    <label><input type="checkbox" id="rebrand" checked> Rebranding a Standalix</label>
+    <label>Traducir a
+      <select id="idioma">
+        <option value="">No traducir</option>
+        <option value="es">Español</option>
+        <option value="it">Italiano</option>
+        <option value="de">Alemán</option>
+      </select>
+    </label>
+    <p class="nota" id="notaIdioma" hidden></p>
+  </div>
+
   <div id="drop" class="drop" tabindex="0" role="button" aria-label="Elegir PDFs">
     <strong>Arrastra aquí los PDF</strong>
     <span>o haz clic para elegirlos</span>
@@ -79,6 +96,7 @@ details pre{font-family:var(--font-mono);font-size:.78rem;white-space:pre-wrap;o
   <div id="lista" class="lista"></div>
 
   <p class="pie" id="aprendido" hidden></p>
+  <p class="pie">Traducción: la hace el traductor integrado de Google Chrome en tu propio ordenador (hace falta Chrome de escritorio, versión 138 o posterior). Es una traducción automática: revísala antes de usar el documento con clientes, sobre todo en fichas de seguridad.</p>
   <p class="pie">Qué se quita: logos y sellos del proveedor (ISO, GMP, sello de empresa, cabeceras de los informes), el bloque Registered Address con email y teléfono, cualquier línea que nombre al proveedor, los enlaces y los metadatos. "Product supplied by …" pasa a "Standalix". Si queda algo, pulsa <em>Quitar algo más</em>, marca la imagen o dibuja un recuadro encima y vuelve a generar el PDF. Lo que marques aquí se recuerda en este navegador para los siguientes certificados.</p>
 </div>
 
@@ -616,6 +634,136 @@ function renderPagina(mupdf, bytes, pno, dpi = 200) {
   return { png: page.toPixmap([z, 0, 0, z, -b[0] * z, -b[1] * z], mupdf.ColorSpace.DeviceRGB, false, false).asPNG(), escala: z, origen: [b[0], b[1]] };
 }
 
+// ---------------------------------------------------------------- traducción
+// 1) unidadesTraducibles: trozos de texto (párrafos o celdas) con su sitio en la página.
+// 2) La página traduce los textos (traductor del navegador).
+// 3) aplicarTraduccion: borra el texto original y escribe la traducción en el mismo sitio,
+//    partiendo líneas y reduciendo la letra si hace falta para que quepa.
+function segmentosDeLinea(ln) {
+  const segs = []; let cur = null, prev = null;
+  for (const c of ln.chars) {
+    if (cur && prev && c.bbox[0] - prev.bbox[2] > Math.max(c.size, 4) * 1.5) cur = null;
+    if (!cur) { cur = { chars: [], bloque: ln.bloque }; segs.push(cur); }
+    cur.chars.push(c); if (c.c.trim()) prev = c;
+  }
+  return segs.map(sg => {
+    while (sg.chars.length && !sg.chars[sg.chars.length - 1].c.trim()) sg.chars.pop();
+    while (sg.chars.length && !sg.chars[0].c.trim()) sg.chars.shift();
+    if (!sg.chars.length) return null;
+    const vis = sg.chars;
+    const negrita = vis.filter(c => /bold|black|heavy|semibold/i.test(c.font.getName())).length > vis.length / 2;
+    return { texto: vis.map(c => c.c).join(""), bbox: vis.reduce((a, c) => R.union(a, c.bbox), null), origen: vis[0].origin,
+      size: Math.max(...vis.map(c => c.size)), negrita, color: vis[0].color, bloque: sg.bloque, sola: false };
+  }).filter(Boolean);
+}
+
+function unidadesTraducibles(mupdf, bytes) {
+  const doc = new mupdf.PDFDocument(bytes), paginas = [];
+  let id = 0;
+  for (let i = 0; i < doc.countPages(); i++) {
+    const page = doc.loadPage(i);
+    const { lineas, vectores } = leerPagina(page);
+    const unidades = [];
+    let ultima = null;
+    for (const ln of lineas) {
+      if (Math.abs(ln.dir[0] - 1) > 1e-3) continue; // texto girado: se deja
+      const segs = segmentosDeLinea(ln);
+      for (const sg of segs) {
+        const u = ultima;
+        const sigue = u && segs.length === 1 && u.sola && sg.bloque === u.bloque && sg.negrita === u.negrita &&
+          Math.abs(sg.size - u.size) < 0.6 && sg.bbox[1] - u.bbox[3] < sg.size * 0.9 && sg.bbox[1] > u.lineas[u.lineas.length - 1].bbox[1] + sg.size * 0.5 &&
+          Math.abs(sg.bbox[0] - u.bbox[0]) < sg.size * 1.5;
+        if (sigue) {
+          const ant = u.texto;
+          u.texto = /[A-Za-zÀ-ÿ]-$/.test(ant) && /^[a-zà-ÿ]/.test(sg.texto) ? ant.slice(0, -1) + sg.texto : ant + " " + sg.texto;
+          u.lineas.push(sg); u.bbox = R.union(u.bbox, sg.bbox);
+        } else {
+          ultima = { id: id++, p: i + 1, texto: sg.texto, lineas: [sg], bbox: [...sg.bbox], size: sg.size, negrita: sg.negrita, color: sg.color, bloque: sg.bloque, sola: segs.length === 1 };
+          unidades.push(ultima);
+        }
+      }
+    }
+    for (const u of unidades) u.traducir = /[A-Za-zÀ-ÿ]{3,}/.test(u.texto);
+    paginas.push({ p: i + 1, bounds: page.getBounds(), unidades, barreras: vectores.filter(v => v[2] - v[0] < 2.5 || v[3] - v[1] < 2.5) });
+  }
+  return paginas;
+}
+
+function partirEnLineas(font, texto, size, ancho) {
+  const palabras = texto.split(/\s+/).filter(Boolean), out = [];
+  let linea = "";
+  for (const w of palabras) {
+    const prueba = linea ? linea + " " + w : w;
+    if (linea && anchoTexto(font, prueba, size) > ancho) { out.push(linea); linea = w; } else linea = prueba;
+  }
+  if (linea) out.push(linea);
+  return out;
+}
+
+function aplicarTraduccion(mupdf, bytes, paginas, traducciones, opciones = {}) {
+  const doc = new mupdf.PDFDocument(bytes);
+  cacheFuentes = new Map();
+  const P = mupdf.PDFPage;
+  const helv = new mupdf.Font("Helvetica"), helvB = new mupdf.Font("Helvetica-Bold");
+  let hechas = 0, reducidas = 0;
+  for (const pg of paginas) {
+    const page = doc.loadPage(pg.p - 1);
+    const b = pg.bounds;
+    const todas = pg.unidades;
+    const cambiar = todas.filter(u => u.traducir && traducciones.has(u.id) && traducciones.get(u.id).trim() && traducciones.get(u.id).trim() !== u.texto);
+    if (!cambiar.length) continue;
+    const borrar = [];
+    for (const u of cambiar) for (const l of u.lineas) borrar.push(rectAjustado(l.bbox, [1, 0]));
+    redactar(page, borrar, P.REDACT_IMAGE_NONE, P.REDACT_LINE_ART_NONE);
+    for (const u of cambiar) {
+      const texto = traducciones.get(u.id).replace(/\s+/g, " ").trim();
+      const solapaV = (a, c) => a[1] < c[3] - 1 && c[1] < a[3] - 1;
+      const solapaH = (a, c) => a[0] < c[2] - 1 && c[0] < a[2] - 1;
+      // hasta dónde puede crecer: la siguiente celda o línea de tabla a la derecha, y lo que haya debajo
+      let der = b[2] - 24, izq = b[0] + 24, abajo = b[3] - 20;
+      const altoU = u.lineas[0].bbox[3] - u.lineas[0].bbox[1];
+      const debajo = o => o.bbox[1] >= u.bbox[3] - altoU * 0.4;
+      for (const o of todas) {
+        if (o === u) continue;
+        if (solapaV(o.bbox, u.bbox) && !debajo(o) && o.bbox[0] >= u.bbox[2] - 1) der = Math.min(der, o.bbox[0] - 4);
+        if (solapaV(o.bbox, u.bbox) && !debajo(o) && o.bbox[2] <= u.bbox[0] + 1) izq = Math.max(izq, o.bbox[2] + 4);
+        if (solapaH(o.bbox, u.bbox) && debajo(o)) abajo = Math.min(abajo, o.bbox[1] - 1);
+      }
+      for (const v of pg.barreras) {
+        if (v[2] - v[0] < 2.5 && solapaV(v, u.bbox) && v[0] >= u.bbox[2] - 1) der = Math.min(der, v[0] - 3);
+        if (v[2] - v[0] < 2.5 && solapaV(v, u.bbox) && v[2] <= u.bbox[0] + 1) izq = Math.max(izq, v[2] + 3);
+        if (v[3] - v[1] < 2.5 && solapaH(v, u.bbox) && v[1] >= u.bbox[3] - 1) abajo = Math.min(abajo, v[1] - 1);
+      }
+      // texto centrado (títulos, celdas): se mantiene centrado en el mismo eje
+      const centros = u.lineas.map(l => (l.bbox[0] + l.bbox[2]) / 2);
+      const eje = (u.bbox[0] + u.bbox[2]) / 2;
+      const centrado = (u.lineas.length > 1 && centros.every(c => Math.abs(c - centros[0]) < 1.5) && u.lineas.some(l => Math.abs(l.bbox[0] - u.bbox[0]) > 2))
+        || (u.lineas.length === 1 && Math.abs(eje - (izq + der) / 2) < 3 && u.bbox[0] - izq > 6);
+      const x0 = u.lineas[0].origen[0], base0 = u.lineas[0].origen[1];
+      const ancho = centrado ? Math.max(2 * Math.min(eje - izq, der - eje), u.bbox[2] - u.bbox[0]) : Math.max(der - x0, u.bbox[2] - x0);
+      const salto = u.lineas.length > 1 ? (u.lineas[u.lineas.length - 1].origen[1] - base0) / (u.lineas.length - 1) : u.size * 1.25;
+      const font = u.negrita ? helvB : helv;
+      let size = u.size, lineas;
+      for (let k = 0; k < 12; k++) {
+        lineas = partirEnLineas(font, texto, size, ancho);
+        const alto = base0 + (lineas.length - 1) * salto * size / u.size + size * 0.25;
+        const cabeAncho = lineas.every(l => anchoTexto(font, l, size) <= ancho + 0.5);
+        if ((alto <= Math.max(abajo, u.bbox[3]) && cabeAncho) || size <= u.size * 0.6) break;
+        size *= 0.95;
+      }
+      if (size < u.size * 0.99) reducidas++;
+      lineas.forEach((l, k) => {
+        const x = centrado ? eje - anchoTexto(font, l, size) / 2 : x0;
+        escribirTexto(mupdf, doc, page, l, [x, base0 + k * salto * size / u.size], size, u.color, [font]);
+      });
+      hechas++;
+    }
+  }
+  if (opciones.idioma) try { doc.getTrailer().get("Root").put("Lang", doc.newString(opciones.idioma)); } catch (e) { }
+  const pdf = doc.saveToBuffer("garbage=deduplicate,compress").asUint8Array().slice();
+  return { pdf, hechas, reducidas };
+}
+
 function prefijoCat(etq, finEtiqueta, lineas, cfg, borrar, reinsertar, cambios, pno) {
   const pref = cfg.cat_number.prefijo;
   const ey = (etq.bbox[1] + etq.bbox[3]) / 2;
@@ -681,7 +829,7 @@ function bibliotecaAprendida(lista) {
   return (lista || []).map((x, i) => ["aprendido " + (i + 1), { bits: Uint8Array.from(x.bits, c => +c), asp: x.asp }]);
 }
 
-return { rebrandPDF, cargarBiblioteca, miniatura, paginas, bibliotecaAprendida, paginasSinTexto, renderPagina };
+return { rebrandPDF, cargarBiblioteca, miniatura, paginas, bibliotecaAprendida, paginasSinTexto, renderPagina, unidadesTraducibles, aplicarTraduccion };
 })();
 
 if (typeof module !== "undefined") module.exports = ENGINE;
@@ -764,12 +912,15 @@ mostrarAprendidos();
 
 function procesar(file){
   const el = tarjeta(file.name);
-  const estado = { file, bytes: null, quitar: [], idx: -1, r: null, salida: nombreSalida(file.name) };
+  const idioma = $("idioma").value, rebrand = $("rebrand").checked;
+  const base = rebrand ? nombreSalida(file.name) : file.name;
+  const estado = { file, bytes: null, quitar: [], idx: -1, r: null, idioma, rebrand,
+    salida: idioma ? base.replace(/(\.pdf)?$/i, ` (${idioma.toUpperCase()}).pdf`) : base };
   cola = cola.then(async () => {
     await listo;
     if(!mupdf){ marcar(el, "err", "Error", "El motor de PDF no está disponible."); return; }
     estado.bytes = new Uint8Array(await file.arrayBuffer());
-    try{ estado.ocr = await leerOCR(el, estado.bytes); }
+    if(rebrand) try{ estado.ocr = await leerOCR(el, estado.bytes); }
     catch(e){ console.error(e); estado.ocr = null; estado.errorOCR = "No se ha podido leer el texto de las páginas escaneadas (" + (e.message || e) + ")."; }
     await ejecutar(el, estado);
   });
@@ -798,12 +949,75 @@ async function leerOCR(el, bytes){
   return ocr;
 }
 
+// ---- Traducción con el traductor integrado de Chrome (funciona en el propio ordenador, sin enviar el PDF a nadie)
+const NOMBRE_IDIOMA = { es: "español", it: "italiano", de: "alemán" };
+const traductores = {}, cacheTrad = new Map();
+function nota(texto){ const n = $("notaIdioma"); n.hidden = !texto; n.textContent = texto || ""; }
+async function prepararTraductor(destino, origen = "en"){
+  const clave = origen + ">" + destino;
+  if(traductores[clave]) return traductores[clave];
+  if(!("Translator" in self)) throw new Error("Este navegador no trae traductor integrado. Abre la web en Google Chrome de escritorio (versión 138 o posterior).");
+  const disp = await Translator.availability({ sourceLanguage: origen, targetLanguage: destino });
+  if(disp === "unavailable") throw new Error(`Chrome no puede traducir de ${origen} a ${NOMBRE_IDIOMA[destino] || destino} en este ordenador.`);
+  traductores[clave] = Translator.create({ sourceLanguage: origen, targetLanguage: destino, monitor(m){
+    m.addEventListener("downloadprogress", e => nota(`Descargando el traductor al ${NOMBRE_IDIOMA[destino]}… ${Math.round(e.loaded * 100)} %`));
+  }}).catch(e => { delete traductores[clave]; throw e; });
+  return traductores[clave];
+}
+// Se prepara al elegir el idioma: Chrome solo deja descargar el traductor justo después de un clic.
+$("idioma").onchange = async () => {
+  const d = $("idioma").value;
+  if(!d){ nota(""); return; }
+  nota(`Preparando el traductor al ${NOMBRE_IDIOMA[d]}…`);
+  try{ await prepararTraductor(d); nota(`Traducción al ${NOMBRE_IDIOMA[d]} lista. Los PDF que sueltes ahora saldrán traducidos.`); }
+  catch(e){ nota(e.message || String(e)); }
+};
+async function idiomaOrigen(textos){
+  try{
+    if(!("LanguageDetector" in self)) return "en";
+    const det = await LanguageDetector.create();
+    const [mejor] = await det.detect(textos.join(" ").slice(0, 3000));
+    return mejor && mejor.confidence > 0.6 ? mejor.detectedLanguage.split("-")[0] : "en";
+  }catch(e){ return "en"; }
+}
+async function traducirPDF(el, pdf, destino){
+  const paginas = ENGINE.unidadesTraducibles(mupdf, pdf);
+  const unidades = paginas.flatMap(p => p.unidades).filter(u => u.traducir);
+  if(!unidades.length) return { pdf, hechas: 0, info: "", aviso: "No hay texto que traducir (¿es un PDF escaneado?)." };
+  const origen = await idiomaOrigen(unidades.map(u => u.texto));
+  if(origen === destino) return { pdf, hechas: 0, info: "", aviso: `El PDF ya parece estar en ${NOMBRE_IDIOMA[destino]}.` };
+  let tr;
+  try{ tr = await prepararTraductor(destino, origen); }
+  catch(e){ return { pdf, hechas: 0, info: "", aviso: "No se ha traducido: " + (e.message || e) + (origen !== "en" ? " Vuelve a elegir el idioma en la lista y suelta el PDF otra vez." : "") }; }
+  const res = new Map(); let n = 0;
+  const cola = [...unidades];
+  const trabajador = async () => {
+    for(let u = cola.shift(); u; u = cola.shift()){
+      const clave = origen + ">" + destino + "|" + u.texto;
+      if(!cacheTrad.has(clave)) cacheTrad.set(clave, await tr.translate(u.texto).catch(() => u.texto));
+      res.set(u.id, cacheTrad.get(clave));
+      if(++n % 10 === 0 || n === unidades.length) marcar(el, "run", `Traduciendo ${n} de ${unidades.length}`);
+    }
+  };
+  await Promise.all([trabajador(), trabajador(), trabajador()]);
+  const t = ENGINE.aplicarTraduccion(mupdf, pdf, paginas, res, { idioma: destino });
+  return { pdf: t.pdf, hechas: t.hechas, reducidas: t.reducidas, info: ` · traducido al ${NOMBRE_IDIOMA[destino]}` };
+}
+
 async function ejecutar(el, estado){
   await new Promise(r => setTimeout(r, 30));
   try{
     const biblio = lib.concat(ENGINE.bibliotecaAprendida(leerAprendidos()));
-    const r = ENGINE.rebrandPDF(mupdf, estado.bytes.slice(), CONFIG, biblio, logo, { fuentesExtra: extra, quitar: estado.quitar, ocr: estado.ocr });
+    const r = estado.rebrand ? ENGINE.rebrandPDF(mupdf, estado.bytes.slice(), CONFIG, biblio, logo, { fuentesExtra: extra, quitar: estado.quitar, ocr: estado.ocr })
+      : { pdf: estado.bytes.slice(), cambios: [], avisos: [], residuos: [], aprendidos: [], paginas: new mupdf.PDFDocument(estado.bytes.slice()).countPages() };
     estado.r = r;
+    let infoTrad = "";
+    if(estado.idioma){
+      const t = await traducirPDF(el, r.pdf, estado.idioma);
+      r.pdf = t.pdf; infoTrad = t.info;
+      if(t.aviso) r.avisos.push(t.aviso);
+      r.cambios.push(`traducido al ${NOMBRE_IDIOMA[estado.idioma]}: ${t.hechas} textos` + (t.reducidas ? ` (${t.reducidas} con la letra algo más pequeña para que quepan)` : ""));
+    }
     if(r.aprendidos.length) guardarAprendidos(r.aprendidos);
     const salida = estado.salida;
     const thumb = ENGINE.miniatura(mupdf, r.pdf, 200);
@@ -820,9 +1034,9 @@ async function ejecutar(el, estado){
     const av = [...r.avisos, ...r.residuos.map(x => "Queda texto de la marca: " + x)];
     if(estado.errorOCR) av.push(estado.errorOCR);
     const nOCR = estado.ocr ? Object.keys(estado.ocr).length : 0;
-    if(!cat) av.push("No se ha encontrado el CAT Number para añadir ST-EA-.");
+    if(!cat && estado.rebrand) av.push("No se ha encontrado el CAT Number para añadir ST-EA-.");
     marcar(el, av.length ? "warn" : "ok", av.length ? "Revisar" : "Listo",
-      `${r.paginas} páginas · ${nLogos} logos y sellos quitados · ${nLineas} líneas borradas` + (nMano ? ` · ${nMano} zonas a mano` : "") + (cat ? " · CAT " + (cat.match(/→ «([^»]+)»/) || [, ""])[1] : "") + (nOCR ? ` · texto leído por OCR en ${nOCR} páginas` : ""));
+      `${r.paginas} páginas` + (estado.rebrand ? ` · ${nLogos} logos y sellos quitados · ${nLineas} líneas borradas` : "") + (nMano ? ` · ${nMano} zonas a mano` : "") + (cat ? " · CAT " + (cat.match(/→ «([^»]+)»/) || [, ""])[1] : "") + (nOCR ? ` · texto leído por OCR en ${nOCR} páginas` : "") + infoTrad);
     ul.hidden = !av.length;
     av.forEach(a => { const li = document.createElement("li"); li.textContent = a; ul.append(li); });
     el.querySelector("details").hidden = false;
