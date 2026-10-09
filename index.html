@@ -45,6 +45,15 @@ details summary{cursor:pointer;color:var(--muted)}
 details pre{font-family:var(--font-mono);font-size:.78rem;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);border-radius:6px;padding:10px;margin:8px 0 0;max-height:260px;overflow:auto}
 .avisos{color:var(--warn);font-size:.88rem;margin:0;padding-left:18px}
 .pie{color:var(--muted);font-size:.82rem;max-width:70ch}
+.revision{display:flex;flex-direction:column;gap:12px;margin-top:6px}
+.revision p{margin:0;color:var(--muted);font-size:.88rem;max-width:65ch}
+.pagina{position:relative;border:1px solid var(--line);border-radius:4px;background:#fff;touch-action:none;user-select:none;cursor:crosshair}
+.pagina img{display:block;width:100%;border:0;border-radius:4px}
+.pagina .num{position:absolute;top:4px;left:6px;font-size:.75rem;color:#5d6878;background:#ffffffd0;padding:0 4px;border-radius:3px}
+.caja{position:absolute;border:2px dashed #233a5e88;border-radius:2px;cursor:pointer}
+.caja:hover{border-color:#233a5e;background:#233a5e14}
+.caja.marcada,.caja.manual{border:2px solid #b42318;background:#b4231833}
+.caja.dibujo{border:2px solid #b42318;background:#b4231822;pointer-events:none}
 @media (max-width:480px){.item{grid-template-columns:64px 1fr}.item img,.thumb-vacia{width:64px}.thumb-vacia{height:84px}}
 @media (prefers-reduced-motion:reduce){.drop{transition:none}}
 </style>
@@ -69,7 +78,8 @@ details pre{font-family:var(--font-mono);font-size:.78rem;white-space:pre-wrap;o
   </div>
   <div id="lista" class="lista"></div>
 
-  <p class="pie">Qué se quita: logos y sellos del proveedor (ISO, GMP, sello de empresa, cabeceras de los informes), el bloque Registered Address con email y teléfono, cualquier línea que nombre al proveedor, los enlaces y los metadatos. "Product supplied by …" pasa a "Standalix". Si un certificado sale marcado como <em>Revisar</em>, ábrelo antes de enviarlo.</p>
+  <p class="pie" id="aprendido" hidden></p>
+  <p class="pie">Qué se quita: logos y sellos del proveedor (ISO, GMP, sello de empresa, cabeceras de los informes), el bloque Registered Address con email y teléfono, cualquier línea que nombre al proveedor, los enlaces y los metadatos. "Product supplied by …" pasa a "Standalix". Si queda algo, pulsa <em>Quitar algo más</em>, marca la imagen o dibuja un recuadro encima y vuelve a generar el PDF. Lo que marques aquí se recuerda en este navegador para los siguientes certificados.</p>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -162,6 +172,11 @@ const R = {
   inter: (a, b) => !(a[2] <= b[0] || b[2] <= a[0] || a[3] <= b[1] || b[3] <= a[1]),
   encoger: (r, f) => { const dx = (r[2] - r[0]) * f, dy = (r[3] - r[1]) * f; return [r[0] + dx, r[1] + dy, r[2] - dx, r[3] - dy]; },
 };
+// fracción del recuadro b que queda dentro de a
+function cubre(a, b) {
+  const w = Math.min(a[2], b[2]) - Math.max(a[0], b[0]), h = Math.min(a[3], b[3]) - Math.max(a[1], b[1]);
+  return w > 0 && h > 0 ? (w * h) / ((b[2] - b[0]) * (b[3] - b[1])) : 0;
+}
 function quadBBox(q) { const xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]]; return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]; }
 function aplicar(m, x, y) { return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]; }
 function lineal(m, x, y) { return [m[0] * x + m[2] * y, m[1] * x + m[3] * y]; }
@@ -308,7 +323,7 @@ function rebrandPDF(mupdf, bytes, cfgRaw, lib, logoPng, opciones = {}) {
   const P = mupdf.PDFPage;
   const doc = new mupdf.PDFDocument(bytes);
   cacheFuentes = new Map();
-  const cambios = [], avisos = [];
+  const cambios = [], avisos = [], aprendidos = [];
   const umbral = cfg.umbral_logo || 40;
   const helv = new mupdf.Font("Helvetica"), helvB = new mupdf.Font("Helvetica-Bold");
   let zonaP1 = null, vectoresP1 = [], anchoP1 = 0;
@@ -321,7 +336,12 @@ function rebrandPDF(mupdf, bytes, cfgRaw, lib, logoPng, opciones = {}) {
     const bounds = page.getBounds();
     let zona = null;
 
-    // 1) Logos y sellos: se comparan tal como se ven impresos
+    // 1) Logos y sellos: se comparan tal como se ven impresos. Además, por posición: lo que
+    //    está en la franja de cabecera o de pie es membrete del proveedor, sea cual sea el diseño.
+    const altoPag = bounds[3] - bounds[1];
+    const franjaSup = bounds[1] + altoPag * (cfg.franja_cabecera ?? 0.16);
+    const franjaInf = bounds[3] - altoPag * (cfg.franja_pie ?? 0.06);
+    const manual = (opciones.quitar || []).filter(q => q.p === pno).map(q => q.bb);
     const logos = [];
     if (imagenes.length) {
       const esc = 2;
@@ -332,12 +352,15 @@ function rebrandPDF(mupdf, bytes, cfgRaw, lib, logoPng, opciones = {}) {
         if (rel[2] - rel[0] < 4 || rel[3] - rel[1] < 4) continue;
         const h = huellaDeRecorte(render, esc, rel);
         if (!h) continue;
+        if (manual.some(m => cubre(m, bb) > 0.8)) { aprendidos.push({ bits: Array.from(h.bits).join(""), asp: h.asp }); continue; }
         const [d, nombre] = distanciaLogo(h, lib);
-        if (d <= umbral) { logos.push(bb); zona = R.union(zona, bb); cambios.push(`p${pno}: logo eliminado`); }
-        else {
-          if (d <= umbral + 20) avisos.push(`p${pno}: imagen parecida a ${nombre} pero no igual; se ha dejado`);
-          else if (bb[3] < bounds[3] * 0.15 && bb[2] - bb[0] > 20) avisos.push(`p${pno}: imagen de cabecera no reconocida; revisar`);
-        }
+        let motivo = null;
+        if (d <= umbral) motivo = nombre.replace(/\.png$/, "");
+        else if (d <= umbral + 25) motivo = "parecido a " + nombre.replace(/\.png$/, "");
+        else if (bb[3] <= franjaSup) motivo = "imagen de cabecera";
+        else if (bb[1] >= franjaInf) motivo = "imagen de pie de página";
+        if (motivo) { logos.push(bb); zona = R.union(zona, bb); cambios.push(`p${pno}: logo eliminado (${motivo})`); }
+        else if (d <= umbral + 45) avisos.push(`p${pno}: hay una imagen que se parece algo a un sello de la marca; mírala y quítala a mano si hace falta`);
       }
     }
 
@@ -408,6 +431,11 @@ function rebrandPDF(mupdf, bytes, cfgRaw, lib, logoPng, opciones = {}) {
       redactar(page, quitar, P.REDACT_IMAGE_REMOVE, P.REDACT_LINE_ART_NONE);
       redactar(page, pixeles.map(r => r), P.REDACT_IMAGE_PIXELS, P.REDACT_LINE_ART_NONE);
     }
+    // borrado a mano: todo lo que haya dentro del recuadro (imagen, dibujo y texto)
+    if (manual.length) {
+      redactar(page, manual, P.REDACT_IMAGE_PIXELS, P.REDACT_LINE_ART_REMOVE_IF_COVERED);
+      manual.forEach(() => cambios.push(`p${pno}: zona borrada a mano`));
+    }
 
     for (const { origen, texto, sp, anchoMax } of reinsertar) {
       const bold = /bold/i.test(sp.font.getName());
@@ -451,7 +479,7 @@ function rebrandPDF(mupdf, bytes, cfgRaw, lib, logoPng, opciones = {}) {
 
   const pdf = doc.saveToBuffer("garbage=deduplicate,compress").asUint8Array().slice();
   const residuos = verificar(mupdf, pdf, cfg);
-  return { pdf, cambios, avisos, residuos, paginas: n };
+  return { pdf, cambios, avisos, residuos, aprendidos, paginas: n };
 }
 
 function prefijoCat(etq, finEtiqueta, lineas, cfg, borrar, reinsertar, cambios, pno) {
@@ -503,7 +531,23 @@ function miniatura(mupdf, pdf, ancho = 300) {
   return page.toPixmap([z, 0, 0, z, -b[0] * z, -b[1] * z], mupdf.ColorSpace.DeviceRGB, false, false).asPNG();
 }
 
-return { rebrandPDF, cargarBiblioteca, miniatura };
+// Páginas renderizadas con sus imágenes, para que el usuario marque lo que falte por quitar.
+function paginas(mupdf, pdf, ancho = 900) {
+  const doc = new mupdf.PDFDocument(pdf), out = [];
+  for (let i = 0; i < doc.countPages(); i++) {
+    const page = doc.loadPage(i), b = page.getBounds(), z = ancho / (b[2] - b[0]);
+    const png = page.toPixmap([z, 0, 0, z, -b[0] * z, -b[1] * z], mupdf.ColorSpace.DeviceRGB, false, false).asPNG();
+    const imgs = leerPagina(page).imagenes.filter(r => r[2] - r[0] >= 4 && r[3] - r[1] >= 4);
+    out.push({ p: i + 1, png, bounds: b, imgs });
+  }
+  return out;
+}
+
+function bibliotecaAprendida(lista) {
+  return (lista || []).map((x, i) => ["aprendido " + (i + 1), { bits: Uint8Array.from(x.bits, c => +c), asp: x.asp }]);
+}
+
+return { rebrandPDF, cargarBiblioteca, miniatura, paginas, bibliotecaAprendida };
 })();
 
 if (typeof module !== "undefined") module.exports = ENGINE;
@@ -564,44 +608,143 @@ async function guardar(filename, data){
   catch(e){ if(e && e.code !== "declined") $("estado").textContent = "No se pudo descargar: " + (e.message || e.code); }
 }
 
+const CLAVE = "stx-aprendidos";
+function leerAprendidos(){ try{ return JSON.parse(localStorage.getItem(CLAVE) || "[]"); }catch(e){ return []; } }
+function guardarAprendidos(nuevos){
+  const lista = leerAprendidos(), vistos = new Set(lista.map(x => x.bits));
+  for(const x of nuevos) if(!vistos.has(x.bits)){ lista.push(x); vistos.add(x.bits); }
+  try{ localStorage.setItem(CLAVE, JSON.stringify(lista)); }catch(e){}
+  mostrarAprendidos();
+}
+function mostrarAprendidos(){
+  const n = leerAprendidos().length, el = $("aprendido");
+  el.hidden = !n;
+  if(!n) return;
+  el.innerHTML = "";
+  el.append(`Este navegador ha aprendido ${n} ${n === 1 ? "imagen" : "imágenes"} que quitar siempre. `);
+  const b = document.createElement("button"); b.textContent = "Olvidarlas";
+  b.onclick = () => { try{ localStorage.removeItem(CLAVE); }catch(e){} mostrarAprendidos(); };
+  el.append(b);
+}
+mostrarAprendidos();
+
 function procesar(file){
   const el = tarjeta(file.name);
+  const estado = { file, bytes: null, quitar: [], idx: -1, r: null, salida: nombreSalida(file.name) };
   cola = cola.then(async () => {
     await listo;
     if(!mupdf){ marcar(el, "err", "Error", "El motor de PDF no está disponible."); return; }
-    await new Promise(r => setTimeout(r, 30));
-    try{
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const r = ENGINE.rebrandPDF(mupdf, bytes, CONFIG, lib, logo, { fuentesExtra: extra });
-      const salida = nombreSalida(file.name);
-      const thumb = ENGINE.miniatura(mupdf, r.pdf, 200);
-      const img = document.createElement("img");
-      img.alt = "Primera página de " + salida;
-      img.src = URL.createObjectURL(new Blob([thumb], {type: "image/png"}));
-      el.querySelector(".thumb-vacia").replaceWith(img);
-      el.querySelector(".nombre").textContent = salida;
-      const revisar = r.residuos.length || r.avisos.length;
-      const nLogos = r.cambios.filter(c => c.includes("logo eliminado")).length;
-      const nLineas = r.cambios.filter(c => c.includes("borrada")).length;
-      const cat = r.cambios.find(c => c.includes("CAT Number"));
-      marcar(el, revisar ? "warn" : "ok", revisar ? "Revisar" : "Listo",
-        `${r.paginas} páginas · ${nLogos} logos y sellos quitados · ${nLineas} líneas borradas` + (cat ? " · CAT " + cat.split("→")[1].replace(/[«»\s]/g, "") : " · CAT Number no encontrado"));
-      const av = [...r.avisos, ...r.residuos.map(x => "Queda texto de la marca: " + x)];
-      if(!cat) av.push("No se ha encontrado el CAT Number para añadir ST-EA-.");
-      if(av.length){ const ul = el.querySelector(".avisos"); ul.hidden = false; av.forEach(a => { const li = document.createElement("li"); li.textContent = a; ul.append(li); }); if(!revisar) marcar(el, "warn", "Revisar"); }
-      el.querySelector("details").hidden = false;
-      el.querySelector("pre").textContent = r.cambios.join("\n");
-      const btn = document.createElement("button");
-      btn.className = "prim"; btn.textContent = "Descargar PDF";
-      btn.onclick = () => guardar(salida, r.pdf.slice());
-      el.querySelector(".acciones").append(btn);
-      resultados.push({ nombre: salida, pdf: r.pdf });
-      actualizarBarra();
-    }catch(e){
-      console.error(e);
-      marcar(el, "err", "Error", "No se ha podido procesar: " + (e.message || e));
-    }
+    estado.bytes = new Uint8Array(await file.arrayBuffer());
+    await ejecutar(el, estado);
   });
+}
+
+async function ejecutar(el, estado){
+  await new Promise(r => setTimeout(r, 30));
+  try{
+    const biblio = lib.concat(ENGINE.bibliotecaAprendida(leerAprendidos()));
+    const r = ENGINE.rebrandPDF(mupdf, estado.bytes.slice(), CONFIG, biblio, logo, { fuentesExtra: extra, quitar: estado.quitar });
+    estado.r = r;
+    if(r.aprendidos.length) guardarAprendidos(r.aprendidos);
+    const salida = estado.salida;
+    const thumb = ENGINE.miniatura(mupdf, r.pdf, 200);
+    const img = document.createElement("img");
+    img.alt = "Primera página de " + salida;
+    img.src = URL.createObjectURL(new Blob([thumb], {type: "image/png"}));
+    el.querySelector(".thumb-vacia, img").replaceWith(img);
+    el.querySelector(".nombre").textContent = salida;
+    const ul = el.querySelector(".avisos"); ul.innerHTML = "";
+    const nLogos = r.cambios.filter(c => c.includes("logo eliminado")).length;
+    const nLineas = r.cambios.filter(c => c.includes("borrada") && !c.includes("a mano")).length;
+    const nMano = r.cambios.filter(c => c.includes("a mano")).length;
+    const cat = r.cambios.find(c => c.includes("CAT Number"));
+    const av = [...r.avisos, ...r.residuos.map(x => "Queda texto de la marca: " + x)];
+    if(!cat) av.push("No se ha encontrado el CAT Number para añadir ST-EA-.");
+    marcar(el, av.length ? "warn" : "ok", av.length ? "Revisar" : "Listo",
+      `${r.paginas} páginas · ${nLogos} logos y sellos quitados · ${nLineas} líneas borradas` + (nMano ? ` · ${nMano} zonas a mano` : "") + (cat ? " · CAT " + cat.split("→")[1].replace(/[«»\s]/g, "") : ""));
+    ul.hidden = !av.length;
+    av.forEach(a => { const li = document.createElement("li"); li.textContent = a; ul.append(li); });
+    el.querySelector("details").hidden = false;
+    el.querySelector("pre").textContent = r.cambios.join("\n");
+    const acc = el.querySelector(".acciones"); acc.innerHTML = "";
+    const btn = document.createElement("button");
+    btn.className = "prim"; btn.textContent = "Descargar PDF";
+    btn.onclick = () => guardar(salida, r.pdf.slice());
+    const rev = document.createElement("button");
+    rev.textContent = "Quitar algo más";
+    rev.onclick = () => abrirRevision(el, estado, rev);
+    acc.append(btn, rev);
+    const viejo = el.querySelector(".revision"); if(viejo) viejo.remove();
+    if(estado.idx < 0){ estado.idx = resultados.length; resultados.push({ nombre: salida, pdf: r.pdf }); }
+    else resultados[estado.idx].pdf = r.pdf;
+    actualizarBarra();
+  }catch(e){
+    console.error(e);
+    marcar(el, "err", "Error", "No se ha podido procesar: " + (e.message || e));
+  }
+}
+
+function abrirRevision(el, estado, boton){
+  const abierta = el.querySelector(".revision");
+  if(abierta){ abierta.remove(); boton.textContent = "Quitar algo más"; return; }
+  boton.textContent = "Cerrar";
+  const cont = document.createElement("div");
+  cont.className = "revision";
+  cont.innerHTML = '<p>Pulsa una imagen para marcarla, o arrastra para dibujar un recuadro sobre lo que quieras borrar (texto, dibujos o imágenes). Pulsa un recuadro rojo para desmarcarlo.</p>';
+  const marcas = estado.quitar.map(q => ({ ...q }));
+  const aplicar = document.createElement("button");
+  aplicar.className = "prim";
+  const actualizar = () => { aplicar.disabled = !marcas.length; aplicar.textContent = marcas.length ? `Borrar ${marcas.length} ${marcas.length === 1 ? "zona" : "zonas"} y volver a generar` : "Marca algo para borrarlo"; };
+  for(const pg of ENGINE.paginas(mupdf, estado.r.pdf, 900)){
+    const b = pg.bounds, W = b[2] - b[0], H = b[3] - b[1];
+    const pct = r => ({ left: (r[0] - b[0]) / W * 100 + "%", top: (r[1] - b[1]) / H * 100 + "%", width: (r[2] - r[0]) / W * 100 + "%", height: (r[3] - r[1]) / H * 100 + "%" });
+    const div = document.createElement("div"); div.className = "pagina";
+    const im = document.createElement("img"); im.alt = "Página " + pg.p; im.draggable = false;
+    im.src = URL.createObjectURL(new Blob([pg.png], {type: "image/png"}));
+    const num = document.createElement("span"); num.className = "num"; num.textContent = "Página " + pg.p;
+    div.append(im, num);
+    const caja = (r, clase) => { const c = document.createElement("div"); c.className = "caja " + clase; Object.assign(c.style, pct(r)); div.append(c); return c; };
+    const pintarManual = m => {
+      const c = caja(m.bb, "manual");
+      c.onpointerdown = e => e.stopPropagation();
+      c.onclick = () => { marcas.splice(marcas.indexOf(m), 1); c.remove(); actualizar(); };
+    };
+    for(const r of pg.imgs){
+      const c = caja(r, "");
+      c.title = "Imagen: pulsa para quitarla";
+      c.onpointerdown = e => e.stopPropagation();
+      c.onclick = () => {
+        const m = marcas.find(m => m.p === pg.p && m.img === r);
+        if(m){ marcas.splice(marcas.indexOf(m), 1); c.classList.remove("marcada"); }
+        else { marcas.push({ p: pg.p, bb: [r[0] - 0.5, r[1] - 0.5, r[2] + 0.5, r[3] + 0.5], img: r }); c.classList.add("marcada"); }
+        actualizar();
+      };
+    }
+    marcas.filter(m => m.p === pg.p && !m.img).forEach(pintarManual);
+    let ini = null, dib = null;
+    const punto = e => { const rc = div.getBoundingClientRect(); return [b[0] + (e.clientX - rc.left) / rc.width * W, b[1] + (e.clientY - rc.top) / rc.height * H]; };
+    div.onpointerdown = e => { ini = punto(e); div.setPointerCapture(e.pointerId); };
+    div.onpointermove = e => {
+      if(!ini) return;
+      const q = punto(e), r = [Math.min(ini[0], q[0]), Math.min(ini[1], q[1]), Math.max(ini[0], q[0]), Math.max(ini[1], q[1])];
+      if(!dib) dib = caja(r, "dibujo"); else Object.assign(dib.style, pct(r));
+      dib.r = r;
+    };
+    div.onpointerup = () => {
+      if(dib && dib.r[2] - dib.r[0] > 3 && dib.r[3] - dib.r[1] > 3){ const m = { p: pg.p, bb: dib.r }; marcas.push(m); pintarManual(m); actualizar(); }
+      if(dib) dib.remove();
+      ini = null; dib = null;
+    };
+    cont.append(div);
+  }
+  aplicar.onclick = async () => {
+    estado.quitar = marcas.map(({ p, bb }) => ({ p, bb }));
+    marcar(el, "run", "Procesando");
+    await ejecutar(el, estado);
+  };
+  actualizar();
+  cont.append(aplicar);
+  el.querySelector(".info").append(cont);
 }
 
 function marcar(el, tipo, texto, resumen){
